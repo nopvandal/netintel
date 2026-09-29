@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netintel"
+description = "DNS, Internet routing, registration, and peering lookups"
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "dnspython>=2.8,<3",
+    "telnetlib3>=4.0,<5",
+]
+
+[project.scripts]
+netintel = "netintel:cli"
+
+[tool.setuptools]
+py-modules = ["netintel"]
+
+[tool.setuptools.dynamic]
+version = {attr = "netintel.VERSION"}

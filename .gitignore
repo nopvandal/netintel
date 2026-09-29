@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.agents/
+.codex/
+.aws/
+.claude/
+.env
+.env.*
+!.env.example
