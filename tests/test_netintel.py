@@ -185,11 +185,14 @@ class ParserTests(unittest.TestCase):
 
     def test_ris_malformed_rows_do_not_become_partial_routes(self):
         for bad in ("13335 2.2.2.0/24 missing", "13335 999.0.0.0/24 10",
-                    "13335 2.2.2.0/24", "13335 2.2.2.0/24 -1"):
+                    "13335 2.2.2.0/24", "13335 2.2.2.0/24 -1", "13335",
+                    "13335 invalid 10", "rate limited"):
             for rows in ("", "13335 1.1.1.0/24 42\n"):
                 with self.subTest(bad=bad, rows=rows), self.assertRaises(n.UpstreamError):
                     n.parse_ris(rows + bad + "\n")
-        self.assertEqual(n.parse_ris("% No entries found\n"), {})
+        for reply in ("", "% banner\n", "   % banner\n", "% No entries found\n", "No entries found\n"):
+            with self.subTest(reply=reply):
+                self.assertEqual(n.parse_ris(reply), {})
 
     def test_txt_and_spf(self):
         self.assertFalse(n.spf_summary([])["present"])
@@ -659,15 +662,16 @@ class CommandTests(unittest.TestCase):
 
     def test_malformed_ris_row_withholds_route_comparison(self):
         client = FakeClient()
-        reply = "13335 1.1.1.0/24 42\n13335 2.2.2.0/24 missing\n"
-        client.whois.side_effect = lambda host, query: reply if host == "riswhois.ripe.net" else "D\n"
-        for grep in (False, True):
-            with self.subTest(grep=grep):
-                text, code = render(n.cmd_routes, SimpleNamespace(target="AS13335"), client=client, grep=grep)
-                self.assertEqual(code, 1)
-                self.assertIn("comparison withheld", text.lower())
-                self.assertNotIn("1 prefix seen by RIPE RIS", text)
-                self.assertNotIn("observed-only", text)
+        for reply in ("13335 1.1.1.0/24 42\n13335 2.2.2.0/24 missing\n",
+                      "13335 1.1.1.0/24 42\n13335\n"):
+            client.whois.side_effect = lambda host, query: reply if host == "riswhois.ripe.net" else "D\n"
+            for grep in (False, True):
+                with self.subTest(grep=grep, reply=reply):
+                    text, code = render(n.cmd_routes, SimpleNamespace(target="AS13335"), client=client, grep=grep)
+                    self.assertEqual(code, 1)
+                    self.assertIn("comparison withheld", text.lower())
+                    self.assertNotIn("1 prefix seen by RIPE RIS", text)
+                    self.assertNotIn("observed-only", text)
 
     def reputation_ip_args(self, ip="192.0.2.10"):
         return SimpleNamespace(target=ip, kind="ip", max_ips=16)
@@ -1170,9 +1174,15 @@ class FourthReviewRegressions(unittest.TestCase):
         for record in ("v=spf1 all", "v=spf1 +all", "v=spf1 -all", "v=spf1 ~all", "v=spf1 ?all", "v=spf1 a mx -all",
                        "v=spf1 a:mail.example.com/24 mx/24 ptr ip4:192.0.2.0/24 ip6:2001:db8::/32 include:_spf.example.com ~all",
                        "v=spf1 exists:%{i}.spf.example.com redirect=_spf.example.com", "v=spf1 exp=explain.example.com -all",
-                       "v=spf1 unknown-modifier=value -all", "V=SPF1 IP4:192.0.2.1 -ALL"):
+                       "v=spf1 unknown-modifier=value -all", "V=SPF1 IP4:192.0.2.1 -ALL",
+                       "v=spf1 a:%{l/}.example.com/24 mx:%{l/}.example.com//64 ptr:%{l/}.example.com -all"):
             with self.subTest(record=record):
                 self.assertTrue(n.spf_summary([record])["valid"])
+        for record in ("v=spf1 a/33 -all", "v=spf1 mx//129 -all",
+                       "v=spf1 ptr/24 -all", "v=spf1 a: -all", "v=spf1 a/01 -all",
+                       "v=spf1 mx//064 -all", "v=spf1 a/٣٢ -all", "v=spf1 a/² -all"):
+            with self.subTest(record=record):
+                self.assertFalse(n.spf_summary([record])["valid"])
         for record, reason in (("v=spf1 --all", "not an SPF mechanism"), ("v=spf1 all:x", "takes no argument"),
                                ("v=spf1 include -all", "needs a domain"), ("v=spf1 ip4:2001:db8::1 -all", "IPv6 address"),
                                ("v=spf1 ip6:192.0.2.1 -all", "IPv4 address"), ("v=spf1 ip4:999.1.1.1 -all", "valid IPv4"),

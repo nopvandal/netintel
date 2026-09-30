@@ -236,10 +236,15 @@ def parse_radb(reply):
 def parse_ris(reply):
     routes = {}
     for line in reply.splitlines():
-        fields = line.split()
-        if len(fields) < 2 or not fields[0].isdigit() or "/" not in fields[1]:
+        line = line.strip()
+        if not line or line.startswith("%") or re.search(r"no (entries|routes|match|results)", line, re.I):
             continue
+        fields = line.split()
+        if not fields[0].isdigit():
+            raise UpstreamError("RIS returned malformed route data; comparison withheld")
         try:
+            if len(fields) < 3 or "/" not in fields[1]:
+                raise ValueError("incomplete route row")
             network = prefix(fields[1])
             peers = int(fields[2])
             if peers < 0:
@@ -247,10 +252,6 @@ def parse_ris(reply):
         except (ValueError, IndexError) as exc:
             raise UpstreamError("RIS returned malformed route data; comparison withheld") from exc
         routes[network] = max(routes.get(network, 0), peers)
-    if not routes and reply.strip() and not re.search(r"no (entries|routes|match|results)", reply, re.I):
-        payload = [line for line in reply.splitlines() if line.strip() and not line.startswith("%")]
-        if payload:
-            raise UpstreamError("RIS reply had no recognizable route rows; comparison withheld")
     return routes
 
 
@@ -283,6 +284,53 @@ def parse_spf_terms(record):
     return terms
 
 
+def spf_domain_and_cidr(value):
+    """Separate a domain-spec from CIDR suffixes without splitting macro delimiters."""
+    macro = False
+    for index, char in enumerate(value):
+        if char == "%" and value[index + 1:index + 2] == "{":
+            macro = True
+        elif char == "}" and macro:
+            macro = False
+        elif char == "/" and not macro:
+            return value[:index], value[index:]
+    return value, ""
+
+
+def spf_cidr_length(value, maximum):
+    return bool(re.fullmatch(r"(?:0|[1-9][0-9]*)", value)) and int(value) <= maximum
+
+
+def spf_a_mx_problem(name, rest, text):
+    if rest.startswith(":"):
+        domain, rest = spf_domain_and_cidr(rest[1:])
+        if not domain:
+            return f"'{text}' needs a domain"
+    if name == "ptr":
+        if rest:
+            return f"'{text}': ptr takes only an optional domain"
+        return None
+    if not rest:
+        return None
+    ipv4_length = ipv6_length = None
+    if rest.startswith("//"):
+        ipv6_length = rest[2:]
+    elif rest.startswith("/"):
+        lengths = rest[1:].split("//")
+        if len(lengths) == 1:
+            ipv4_length = lengths[0]
+        elif len(lengths) == 2:
+            ipv4_length, ipv6_length = lengths
+        else:
+            return f"'{text}' has an invalid CIDR length"
+    else:
+        return f"'{text}' has an invalid CIDR length"
+    if (ipv4_length is not None and not spf_cidr_length(ipv4_length, 32)) or \
+            (ipv6_length is not None and not spf_cidr_length(ipv6_length, 128)):
+        return f"'{text}' has an invalid CIDR length"
+    return None
+
+
 def spf_term_problem(term):
     """None when a parsed term is a valid SPF mechanism or modifier (RFC 7208 5, 6, 12), else the reason it is not."""
     text = term["text"]
@@ -297,8 +345,8 @@ def spf_term_problem(term):
         return f"'{text}': all takes no argument"
     if name in ("include", "exists") and (len(rest) < 2 or rest[0] != ":"):
         return f"'{text}' needs a domain"
-    if name in ("a", "mx", "ptr") and rest and rest[0] not in ":/":
-        return f"'{text}' is not an SPF mechanism or modifier"
+    if name in ("a", "mx", "ptr"):
+        return spf_a_mx_problem(name, rest, text)
     if name in ("ip4", "ip6"):
         try:
             if not rest.startswith(":"):
