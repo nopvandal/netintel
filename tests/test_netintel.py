@@ -135,6 +135,31 @@ class InputTests(unittest.TestCase):
             self.assertIn("help' for usage", stderr.getvalue())
             self.assertNotIn("{lookup,domain", stderr.getvalue(), "the full usage block should not be printed")
 
+    def test_abbreviated_options_work_before_and_after_targets(self):
+        for option, value, field, expected in (("--time", "2", "timeout", 2.0),
+                                               ("--max", "3", "max_ips", 3),
+                                               ("--col", "never", "color", "never"),
+                                               ("--res", "1.1.1.1", "resolver", "1.1.1.1"),
+                                               ("--dns", "tcp", "dns_transport", "tcp")):
+            for argv in ([option, value, "example.com"], ["example.com", option, value],
+                         [option, value, "domain", "example.com"]):
+                with self.subTest(argv=argv):
+                    args, _ = n.parse_args(argv)
+                    self.assertEqual((args.command, args.target), ("domain", "example.com"))
+                    self.assertEqual(getattr(args, field), expected)
+
+    def test_legacy_neighbors_alias_is_hidden_but_still_works(self):
+        for command in ("neighbors", "neighbours"):
+            args, _ = n.parse_args(["--timeout", "2", command, "13335", "--grep"])
+            self.assertEqual((args.command, args.target, args.grep), ("neighbors", "AS13335", True))
+        for argv in (["--help"], ["neighbors", "--help"], ["neighbours", "--help"]):
+            stdout = io.StringIO()
+            with self.subTest(argv=argv), contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as caught:
+                n.parse_args(argv)
+            self.assertEqual(caught.exception.code, 0)
+            self.assertIn("neighbors", stdout.getvalue())
+            self.assertNotIn("neighbours", stdout.getvalue())
+
     def test_resolver_names(self):
         for value in ["dns.quad9.net", "1.1.1.1", "2606:4700:4700::1111"]:
             self.assertEqual(n.resolver_spec(value), value)
@@ -157,6 +182,14 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(n.parse_ris("% banner\n13335 1.1.1.0/24 42\n"), {"1.1.1.0/24": 42})
         with self.assertRaises(n.UpstreamError):
             n.parse_ris("rate limited")
+
+    def test_ris_malformed_rows_do_not_become_partial_routes(self):
+        for bad in ("13335 2.2.2.0/24 missing", "13335 999.0.0.0/24 10",
+                    "13335 2.2.2.0/24", "13335 2.2.2.0/24 -1"):
+            for rows in ("", "13335 1.1.1.0/24 42\n"):
+                with self.subTest(bad=bad, rows=rows), self.assertRaises(n.UpstreamError):
+                    n.parse_ris(rows + bad + "\n")
+        self.assertEqual(n.parse_ris("% No entries found\n"), {})
 
     def test_txt_and_spf(self):
         self.assertFalse(n.spf_summary([])["present"])
@@ -421,6 +454,26 @@ class FeedTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_network_info_rejects_malformed_fields_without_inventing_origins(self):
+        client = n.Client()
+        for data in ({"prefix": "1.1.1.0/24", "asns": "13335"},
+                     {"prefix": "1.1.1.0/24", "asns": {"13335": "label"}},
+                     {"prefix": [], "asns": []}, {"prefix": None, "asns": None}):
+            with self.subTest(data=data), patch.object(client, "ripe", return_value=data):
+                with self.assertRaises(n.UpstreamError):
+                    client.network("1.1.1.1")
+        with patch.object(client, "ripe", return_value={"prefix": "1.1.1.0/24", "asns": [13335, "64500"]}):
+            self.assertEqual(client.network("1.1.1.1")["asns"], ["AS13335", "AS64500"])
+        with patch.object(client, "ripe", return_value={"prefix": None, "asns": []}):
+            self.assertEqual(client.network("1.1.1.1"), {"ip": "1.1.1.1", "prefix": None, "asns": []})
+
+    def test_neighbors_preserves_ripestat_endpoint_and_fields(self):
+        client = FakeClient()
+        payload = {"neighbours": [{"asn": 64500, "type": "left", "power": 2}]}
+        client.ripe = Mock(return_value=payload)
+        self.assertEqual(n.asn_neighbors(client, "AS13335"), payload)
+        client.ripe.assert_called_once_with("asn-neighbours", resource="AS13335")
+
     def test_cname_ttl_and_txt_strings(self):
         answer = dns.message.make_response(dns.message.make_query("example.com", "TXT"))
         answer.answer = [dns.rrset.from_text("example.com.", 60, "IN", "CNAME", "www.example.com."),
@@ -538,7 +591,7 @@ class OutputTests(unittest.TestCase):
         self.assertIn("? Source  unknown  down", text)
         self.assertIn("2 lookups failed; the results above are partial", text)
 
-    def test_colour_and_ascii(self):
+    def test_color_and_ascii(self):
         text, _ = self.capture(self.human(color=True), lambda out: (out.section("S", "s"), out.status("k", "L", "bad", "listed")))
         self.assertIn("\x1b[1;36mS\x1b[0m", text)
         self.assertIn("\x1b[1;31mlisted\x1b[0m", text)
@@ -573,6 +626,49 @@ class OutputTests(unittest.TestCase):
 
 
 class CommandTests(unittest.TestCase):
+    def test_bulk_empty_and_error_responses_fail(self):
+        for command, host in (("bulk-bgp", "bgp.tools"), ("bulk-cymru", "whois.cymru.com")):
+            for reply in ("", " \r\n", "Error: service unavailable\n", "% ERROR: query limit exceeded\n",
+                          "AS | IP | AS Name\nRate limit exceeded\n"):
+                for grep in (False, True):
+                    client = Mock()
+                    client.tcp.return_value = reply
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with self.subTest(command=command, reply=reply, grep=grep), \
+                            patch.object(n, "Client", return_value=client), patch.object(sys, "stdin", io.StringIO("1.1.1.1\n")), \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        code = n.main([command] + (["--grep"] if grep else []))
+                    self.assertEqual(code, 1)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn(f"error: {host}:", stderr.getvalue())
+                    self.assertIn(reply.strip() or "empty response", stderr.getvalue())
+                    client.tcp.assert_called_once_with(host, "begin\r\nverbose\r\n1.1.1.1\r\nend\r\n")
+
+    def test_bulk_valid_replies_keep_raw_output(self):
+        client = Mock()
+        for command in ("bulk-bgp", "bulk-cymru"):
+            for reply in ("AS | IP | AS Name\r\n13335 | 1.1.1.1 | CLOUDFLARENET\r\n",
+                          "AS | IP | AS Name\nNA | 192.0.2.1 | NA\n"):
+                client.tcp.return_value = reply
+                args = SimpleNamespace(command=command, bulk_payload=n.bulk_request(["1.1.1.1"]))
+                for grep in (False, True):
+                    with self.subTest(command=command, grep=grep, reply=reply):
+                        text, code = render(n.cmd_bulk, args, client=client, grep=grep)
+                        self.assertEqual(code, 0)
+                        self.assertEqual(text, reply.replace("\r\n", "\n"))
+
+    def test_malformed_ris_row_withholds_route_comparison(self):
+        client = FakeClient()
+        reply = "13335 1.1.1.0/24 42\n13335 2.2.2.0/24 missing\n"
+        client.whois.side_effect = lambda host, query: reply if host == "riswhois.ripe.net" else "D\n"
+        for grep in (False, True):
+            with self.subTest(grep=grep):
+                text, code = render(n.cmd_routes, SimpleNamespace(target="AS13335"), client=client, grep=grep)
+                self.assertEqual(code, 1)
+                self.assertIn("comparison withheld", text.lower())
+                self.assertNotIn("1 prefix seen by RIPE RIS", text)
+                self.assertNotIn("observed-only", text)
+
     def reputation_ip_args(self, ip="192.0.2.10"):
         return SimpleNamespace(target=ip, kind="ip", max_ips=16)
 
@@ -845,7 +941,7 @@ class SecondReviewRegressions(unittest.TestCase):
         with patch("socket.create_connection", return_value=self.connection([b"first ", b"second\r\n", b""])):
             self.assertEqual(n.Client().tcp("whois.example", "q\r\n"), "first second\r\n")
 
-    def test_robtex_rejects_unrecognised_replies(self):
+    def test_robtex_rejects_unrecognized_replies(self):
         client = Mock()
         for body in ("<html>Service temporarily unavailable</html>", "Too many requests", '{"status": "ratelimited"}',
                      '{"rrtype":"A","rrdata":"192.0.2.1"}\nnot json\nnot json either\n'):

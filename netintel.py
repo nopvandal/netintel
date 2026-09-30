@@ -87,10 +87,10 @@ DNSSEC_ALGORITHMS = {5: "RSASHA1", 7: "RSASHA1-NSEC3-SHA1", 8: "RSASHA256", 10: 
                      13: "ECDSAP256SHA256", 14: "ECDSAP384SHA384", 15: "ED25519", 16: "ED448"}
 DS_DIGESTS = {1: "SHA-1", 2: "SHA-256", 4: "SHA-384"}
 RPKI_STATES = {
-    "valid": ("good", "valid", "a ROA authorises this origin at this prefix length"),
-    "invalid_asn": ("bad", "invalid", "ROAs cover this prefix, but none authorise this origin AS"),
+    "valid": ("good", "valid", "a ROA authorizes this origin at this prefix length"),
+    "invalid_asn": ("bad", "invalid", "ROAs cover this prefix, but none authorize this origin AS"),
     "invalid_length": ("bad", "invalid", "the announcement is more specific than the ROA maxLength allows"),
-    "invalid": ("bad", "invalid", "the covering ROAs do not authorise this announcement"),
+    "invalid": ("bad", "invalid", "the covering ROAs do not authorize this announcement"),
     "unknown": ("warn", "not found", "no ROA covers this prefix, so validating routers treat it as unknown"),
 }
 
@@ -212,6 +212,14 @@ def positive_count(value):
 
 # ---------- parsers ----------
 
+def validate_whois_reply(host, reply):
+    if not reply.strip():
+        raise UpstreamError(f"{host}: empty response")
+    if re.search(r"(?im)^(?:%\s*(?:error|fatal)|error:|access denied|query limit|rate limit)", reply):
+        raise UpstreamError(f"{host}: {reply.strip()}")
+    return reply
+
+
 def parse_radb(reply):
     """Strip IRRd framing without converting server errors into empty results."""
     items = []
@@ -229,13 +237,15 @@ def parse_ris(reply):
     routes = {}
     for line in reply.splitlines():
         fields = line.split()
-        if len(fields) < 3 or not fields[0].isdigit() or "/" not in fields[1]:
+        if len(fields) < 2 or not fields[0].isdigit() or "/" not in fields[1]:
             continue
         try:
             network = prefix(fields[1])
             peers = int(fields[2])
-        except ValueError:
-            continue
+            if peers < 0:
+                raise ValueError("negative peer count")
+        except (ValueError, IndexError) as exc:
+            raise UpstreamError("RIS returned malformed route data; comparison withheld") from exc
         routes[network] = max(routes.get(network, 0), peers)
     if not routes and reply.strip() and not re.search(r"no (entries|routes|match|results)", reply, re.I):
         payload = [line for line in reply.splitlines() if line.strip() and not line.startswith("%")]
@@ -737,6 +747,8 @@ class Client:
 
     def network(self, ip):
         data = require(self.ripe("network-info", resource=ip), "prefix", "asns", source="RIPEstat network-info")
+        expect(data["prefix"], (str, type(None)), "RIPEstat network-info", "prefix")
+        expect_list(data["asns"], (str, int), "RIPEstat network-info", "asns")
         try:
             route = prefix(data["prefix"]) if data.get("prefix") else None
             origins = [asn(str(a)) for a in data.get("asns", [])]
@@ -795,12 +807,7 @@ class Client:
     def whois(self, host, query):
         if "\n" in query or "\r" in query:
             raise ValueError("WHOIS query cannot contain newlines")
-        reply = self.tcp(host, query + "\r\n")
-        if not reply.strip():
-            raise UpstreamError(f"{host}: empty response")
-        if re.search(r"(?im)^(?:%\s*(?:error|fatal)|error:|access denied|query limit|rate limit)", reply):
-            raise UpstreamError(f"{host}: {reply.strip()}")
-        return reply
+        return validate_whois_reply(host, self.tcp(host, query + "\r\n"))
 
 
 def require(data, *keys, source):
@@ -2831,7 +2838,7 @@ def cmd_as_set(ctx):
 
 def cmd_bulk(ctx):
     host = "bgp.tools" if ctx.args.command == "bulk-bgp" else "whois.cymru.com"
-    result = attempt(ctx.client.tcp, host, ctx.args.bulk_payload)
+    result = attempt(lambda: validate_whois_reply(host, ctx.client.tcp(host, ctx.args.bulk_payload)))
     if result.ok:
         ctx.out.raw_lines(result.value.rstrip("\n").splitlines())
     else:
@@ -3008,7 +3015,7 @@ def build_parser():
         "he": "interactive Hurricane Electric session", "check": "check dependencies, configuration and connectivity",
         "deps": "show installation instructions", "version": "show version", "help": "show help",
     }
-    aliases = {"neighbors": ["neighbours"], "reputation": ["rep"]}
+    aliases = {"reputation": ["rep"]}
     for name, description in descriptions.items():
         command = sub.add_parser(name, help=description, parents=[shared], aliases=aliases.get(name, []))
         if name in {"lookup", "domain", "ip", "asn", "prefix", "routes", "reputation", "as-set", "rpki", "ripestat", "abuse", "neighbors", "ix"}:
@@ -3021,7 +3028,8 @@ def build_parser():
             command.add_argument("file", nargs="?", default="-")
         if name == "check":
             command.add_argument("--net", action="store_true")
-    return parser, set(descriptions) | {alias for names in aliases.values() for alias in names}
+    # Normalize the legacy spelling before argparse so it never appears in help.
+    return parser, set(descriptions) | {alias for names in aliases.values() for alias in names} | {"neighbours"}
 
 
 def parse_args(argv):
@@ -3029,15 +3037,19 @@ def parse_args(argv):
     argv = list(argv)
     # Insert 'lookup' before the first positional target, skipping global option values.
     index = 0
+    value_options = {"--timeout", "--max-ips", "--resolver", "--dns-transport", "--color"}
     while index < len(argv):
         item = argv[index]
-        if item in {"--timeout", "--max-ips", "--resolver", "--dns-transport", "--color"}:
+        # argparse also accepts unambiguous long-option abbreviations.
+        if item.startswith("--") and item != "--" and any(option.startswith(item) for option in value_options):
             index += 2
             continue
         if item.startswith("-"):
             index += 1
             continue
-        if item not in commands:
+        if item == "neighbours":
+            argv[index] = "neighbors"
+        elif item not in commands:
             argv.insert(index, "lookup")
         break
     if not argv:

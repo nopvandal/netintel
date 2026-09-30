@@ -147,7 +147,7 @@ concurrently, but queries that depend on earlier results add to the total time.
 | `rpki PREFIX ASN` | Origin validation and matching ROAs |
 | `ripestat RESOURCE` | RIPEstat WHOIS aggregation |
 | `abuse RESOURCE` | Abuse contacts |
-| `neighbors ASN`, `neighbours ASN` | Observed AS-path neighbors |
+| `neighbors ASN` | Observed AS-path neighbors |
 | `ix ASN` | PeeringDB exchange presence |
 | `bulk-bgp [FILE]`, `bulk-cymru [FILE]` | Bulk lookups; reads stdin if no file is given |
 | `ris-peers` | RIS peer listing |
